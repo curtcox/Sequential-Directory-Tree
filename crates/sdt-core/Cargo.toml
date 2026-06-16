@@ -1,0 +1,15 @@
+[package]
+name = "sdt-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
