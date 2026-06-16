@@ -216,6 +216,130 @@ fn portability_no_collision_with_prefixed_dir() {
         .success();
 }
 
+#[test]
+fn add_in_appends_next_covered_file() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().to_str().unwrap();
+    touch(t.path().join("a"), b"a");
+    // Extends past the last file: `a` is present, so the next is `b`.
+    sdt()
+        .args(["add", path, "--content", "hello"])
+        .assert()
+        .success()
+        .stdout(format!("{}/b\n", path));
+    assert_eq!(fs::read(t.path().join("b")).unwrap(), b"hello");
+}
+
+#[test]
+fn add_dense_fills_the_gap() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().to_str().unwrap();
+    touch(t.path().join("a"), b"a");
+    touch(t.path().join("c"), b"c"); // gap at `b`
+    sdt()
+        .args(["add", path, "--dense", "--content", "x"])
+        .assert()
+        .success()
+        .stdout(format!("{}/b\n", path));
+}
+
+#[test]
+fn add_nest_wraps_in_new_subdir_as_file_a() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().to_str().unwrap();
+    sdt()
+        .args(["add", path, "--nest", "--content", "doc"])
+        .assert()
+        .success()
+        .stdout(format!("{}/0/a\n", path));
+    assert_eq!(fs::read(t.path().join("0").join("a")).unwrap(), b"doc");
+}
+
+#[test]
+fn add_unique_in_returns_existing_path() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().to_str().unwrap();
+    touch(t.path().join("a"), b"dup");
+    // Identical contents already covered: report `a`, create nothing.
+    sdt()
+        .args(["add", path, "--unique", "--content", "dup"])
+        .assert()
+        .success()
+        .stdout(format!("{}/a\n", path));
+    assert!(!t.path().join("b").exists());
+    // Different contents: a real append to `b`.
+    sdt()
+        .args(["add", path, "--unique", "--content", "new"])
+        .assert()
+        .success()
+        .stdout(format!("{}/b\n", path));
+}
+
+#[test]
+fn add_unique_nest_checks_first_file_of_each_subdir() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().to_str().unwrap();
+    sdt()
+        .args(["add", path, "--nest", "--content", "doc"])
+        .assert()
+        .success()
+        .stdout(format!("{}/0/a\n", path));
+    // Same contents as subdir 0's `a`: dedup hits, returns it.
+    sdt()
+        .args(["add", path, "--nest", "--unique", "--content", "doc"])
+        .assert()
+        .success()
+        .stdout(format!("{}/0/a\n", path));
+    assert!(!t.path().join("1").exists());
+    // New contents: a fresh subdir `1`.
+    sdt()
+        .args(["add", path, "--nest", "--unique", "--content", "other"])
+        .assert()
+        .success()
+        .stdout(format!("{}/1/a\n", path));
+}
+
+#[test]
+fn add_from_stdin_and_file() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().to_str().unwrap();
+    sdt()
+        .args(["add", path])
+        .write_stdin("piped")
+        .assert()
+        .success();
+    assert_eq!(fs::read(t.path().join("a")).unwrap(), b"piped");
+    let src = t.path().join("src.txt");
+    touch(src.clone(), b"fromfile");
+    sdt()
+        .args(["add", path, "--from", src.to_str().unwrap()])
+        .assert()
+        .success();
+    assert_eq!(fs::read(t.path().join("b")).unwrap(), b"fromfile");
+}
+
+#[test]
+fn add_delete_drops_stale_sidecars_regen_refreshes_them() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().to_str().unwrap();
+    touch(t.path().join("a"), b"a");
+    sdt().args(["sidecar", path]).assert().success();
+    assert!(t.path().join(".0").exists());
+    // Default: delete the now-stale sidecar.
+    sdt()
+        .args(["add", path, "--content", "x"])
+        .assert()
+        .success();
+    assert!(!t.path().join(".0").exists());
+    // Regen: rewrite it to match present state, leaving a conforming tree.
+    sdt()
+        .args(["add", path, "--content", "y", "--sidecar", "regen"])
+        .assert()
+        .success();
+    assert!(t.path().join(".0").exists());
+    sdt().args(["check", path]).assert().success();
+}
+
 fn read_sidecars(path: &Path) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     collect_sidecars(path, path, &mut out);

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -123,12 +123,47 @@ enum Command {
         manifest_as_extra: bool,
         paths: Vec<PathBuf>,
     },
+    /// Add a file with given contents, either *in* the directory (next covered
+    /// file) or, with --nest, *under* it (file `a` inside a fresh covered subdir).
+    Add {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Wrap the content in a new covered subdirectory (place it as file `a`)
+        /// instead of adding it as the next covered file in PATH.
+        #[arg(long)]
+        nest: bool,
+        /// Read contents from this file instead of stdin.
+        #[arg(long, conflicts_with = "content")]
+        from: Option<PathBuf>,
+        /// Use this literal string as the contents instead of stdin.
+        #[arg(long)]
+        content: Option<String>,
+        /// Prevent duplicates: if a covered file with identical contents already
+        /// exists, print its path and create nothing. For --nest, only the first
+        /// covered file (`a`) of each immediate subdir is compared.
+        #[arg(long)]
+        unique: bool,
+        /// Fill the lowest vacant ordinal instead of extending past the last one.
+        #[arg(long)]
+        dense: bool,
+        /// What to do with sidecars the new file invalidates (never left stale).
+        #[arg(long, value_enum, default_value = "delete")]
+        sidecar: SidecarArg,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum KindArg {
     File,
     Dir,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SidecarArg {
+    /// Delete every `.0` the addition invalidates.
+    Delete,
+    /// Regenerate the changed node's `.0` (and refresh existing ancestor ones).
+    Regen,
 }
 
 impl From<KindArg> for Kind {
@@ -249,6 +284,25 @@ fn run() -> Result<u8> {
             width,
             manifest_as_extra,
             paths,
+        ),
+        Command::Add {
+            path,
+            nest,
+            from,
+            content,
+            unique,
+            dense,
+            sidecar,
+        } => cmd_add(
+            &path,
+            AddOptions {
+                nest,
+                from,
+                content,
+                unique,
+                dense,
+                sidecar,
+            },
         ),
     }
 }
@@ -748,6 +802,186 @@ fn extract_pack(tree: &Path, dest: &Path, manifest: &Path) -> Result<u8> {
         fs::copy(tree.join(stored), out)?;
     }
     Ok(0)
+}
+
+struct AddOptions {
+    nest: bool,
+    from: Option<PathBuf>,
+    content: Option<String>,
+    unique: bool,
+    dense: bool,
+    sidecar: SidecarArg,
+}
+
+fn cmd_add(path: &Path, opts: AddOptions) -> Result<u8> {
+    if !path.is_dir() {
+        return Err(anyhow!("{} is not a directory", path.display()));
+    }
+    let bytes = read_content(&opts)?;
+
+    // Prevent duplicates: report the existing match and create nothing (exit 0).
+    if opts.unique {
+        if let Some(existing) = find_duplicate(path, opts.nest, &bytes)? {
+            println!("{}", existing.display());
+            return Ok(0);
+        }
+    }
+
+    // Allocate the next covered name and write the file. The directly-changed
+    // node (whose `.0` we must touch afterward) is PATH for an in-place add, or
+    // the freshly created subdir for a nested add.
+    let (created, changed_child) = if opts.nest {
+        let dir = path.join(next_name(path, Kind::Dir, opts.dense)?);
+        fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let file = dir.join(storage_name(1, Kind::File)?); // first covered file `a`
+        fs::write(&file, &bytes).with_context(|| format!("writing {}", file.display()))?;
+        (file, Some(dir))
+    } else {
+        let file = path.join(next_name(path, Kind::File, opts.dense)?);
+        fs::write(&file, &bytes).with_context(|| format!("writing {}", file.display()))?;
+        (file, None)
+    };
+
+    maintain_sidecars(path, changed_child.as_deref(), opts.sidecar)?;
+    println!("{}", created.display());
+    Ok(0)
+}
+
+fn read_content(opts: &AddOptions) -> Result<Vec<u8>> {
+    if let Some(from) = &opts.from {
+        fs::read(from).with_context(|| format!("reading {}", from.display()))
+    } else if let Some(content) = &opts.content {
+        Ok(content.clone().into_bytes())
+    } else {
+        let mut buf = Vec::new();
+        io::stdin().lock().read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+/// The next on-disk storage name for `kind` in `path`: the lowest vacant ordinal
+/// when `dense`, otherwise one past the highest present ordinal.
+fn next_name(path: &Path, kind: Kind, dense: bool) -> Result<String> {
+    let present = covered_ordinals(path, kind)?;
+    let next = if dense {
+        (1u64..).find(|n| !present.contains(n)).unwrap()
+    } else {
+        present.iter().copied().max().unwrap_or(0) + 1
+    };
+    if next > kind.capacity() {
+        return Err(anyhow!("{} namespace capacity exceeded", kind_name(kind)));
+    }
+    Ok(storage_name(next, kind)?)
+}
+
+fn covered_ordinals(path: &Path, kind: Kind) -> Result<BTreeSet<u64>> {
+    Ok(classify_dir(path)?
+        .into_iter()
+        .filter_map(|e| match (&e.class, kind) {
+            (Class::CoveredFile { ordinal }, Kind::File)
+            | (Class::CoveredDir { ordinal }, Kind::Dir) => Some(*ordinal),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Find an existing covered file whose contents equal `bytes`. For an in-place
+/// add this scans every covered file of `path`; for a nested add it scans the
+/// first covered file (`a`, lowest ordinal) of each immediate covered subdir.
+/// Candidates are visited in ordinal order for deterministic results.
+fn find_duplicate(path: &Path, nest: bool, bytes: &[u8]) -> Result<Option<PathBuf>> {
+    let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
+    for e in classify_dir(path)? {
+        match (&e.class, nest) {
+            (Class::CoveredFile { ordinal }, false) => candidates.push((*ordinal, e.path)),
+            (Class::CoveredDir { ordinal }, true) => {
+                if let Some(first) = first_covered_file(&e.path)? {
+                    candidates.push((*ordinal, first));
+                }
+            }
+            _ => {}
+        }
+    }
+    candidates.sort_by_key(|(ordinal, _)| *ordinal);
+    for (_, candidate) in candidates {
+        if file_eq(&candidate, bytes)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn first_covered_file(dir: &Path) -> Result<Option<PathBuf>> {
+    Ok(classify_dir(dir)?
+        .into_iter()
+        .filter_map(|e| match e.class {
+            Class::CoveredFile { ordinal } => Some((ordinal, e.path)),
+            _ => None,
+        })
+        .min_by_key(|(ordinal, _)| *ordinal)
+        .map(|(_, path)| path))
+}
+
+fn file_eq(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let meta = fs::metadata(path)?;
+    if meta.len() != bytes.len() as u64 {
+        return Ok(false);
+    }
+    Ok(fs::read(path)? == bytes)
+}
+
+/// Keep sidecars valid after an addition. The change dirties the `.0` of the
+/// changed node, of `target`, and of every ancestor that has one. `Delete` drops
+/// each; `Regen` rewrites the changed node's and `target`'s from present state
+/// and refreshes existing ancestor ones (it never fabricates new ancestor ones).
+fn maintain_sidecars(target: &Path, changed_child: Option<&Path>, mode: SidecarArg) -> Result<()> {
+    match mode {
+        SidecarArg::Delete => {
+            if let Some(child) = changed_child {
+                remove_sidecar(child)?;
+            }
+            remove_sidecar(target)?;
+            for ancestor in ancestors_with_sidecar(target) {
+                remove_sidecar(&ancestor)?;
+            }
+        }
+        SidecarArg::Regen => {
+            if let Some(child) = changed_child {
+                write_sidecar(child)?;
+            }
+            write_sidecar(target)?;
+            for ancestor in ancestors_with_sidecar(target) {
+                write_sidecar(&ancestor)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_sidecar(dir: &Path) -> Result<()> {
+    let sidecar = dir.join(".0");
+    if sidecar.exists() {
+        fs::remove_file(&sidecar).with_context(|| format!("removing {}", sidecar.display()))?;
+    }
+    Ok(())
+}
+
+fn write_sidecar(dir: &Path) -> Result<()> {
+    let text = derive_subtree(dir)?.serialize();
+    let sidecar = dir.join(".0");
+    fs::write(&sidecar, text).with_context(|| format!("writing {}", sidecar.display()))?;
+    Ok(())
+}
+
+fn ancestors_with_sidecar(target: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut cur = target.to_path_buf();
+    while cur.pop() {
+        if cur.join(".0").exists() {
+            out.push(cur.clone());
+        }
+    }
+    out
 }
 
 fn nodes(path: &Path, recursive: bool) -> Result<Vec<PathBuf>> {

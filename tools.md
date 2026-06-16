@@ -12,7 +12,7 @@
 ## Design principle
 
 One multitool, `sdt`, with a **small set of verbs**. Behavior is selected by
-**flags**, not by proliferating separate commands. Seven verbs cover the whole
+**flags**, not by proliferating separate commands. Eight verbs cover the whole
 surface:
 
 | Verb | Mutates? | One-line job | Spec |
@@ -22,6 +22,7 @@ surface:
 | `sdt check` | no | conformance, format, portability, tree diff | §4.3, §6, §7 |
 | `sdt sidecar` | `.0` only | regenerate / refresh / watch sidecars | §4, §5 |
 | `sdt name` | optional | allocate the next covered name(s) | §3.3, §3.4 |
+| `sdt add` | entries + `.0` | write a file *in* a node, or *nested* under it, with dedup | §3.3, §4 |
 | `sdt compact` | entries + `.0` | renumber covered entries to dense `1..N` | §3.6 r6, G6 |
 | `sdt pack` | entries + `.0` | import a fileset in / export it out, with manifest | §6.1 |
 
@@ -204,6 +205,47 @@ when to nest into a subdirectory rather than widen a node past the §6.1 advisor
 
 ---
 
+## `sdt add` — write a file, in or under a node (§3.3, §4)
+
+Materializes a **single** file from supplied contents, allocating its covered
+name with the `sdt name` logic. Two placements, one verb:
+
+- **in** (default) — the content becomes the **next covered file** of the node
+  (extends the file sequence; the file sequence grows by one).
+- **under** (`--nest`) — a **fresh covered subdirectory** is allocated under the
+  node and the content lands inside it as the first covered file `a` (the
+  directory sequence grows by one; the new subdir holds exactly the new file).
+
+Where `sdt name --create` makes an *empty* covered entry, `add` writes real
+contents and can deduplicate. It always prints the **path of the file** it
+created (or, under `--unique`, the path of the pre-existing match).
+
+```
+sdt add [PATH] [--nest] [--from FILE | --content STR] [--unique] [--dense] [--sidecar delete|regen]
+```
+
+| Flag | Meaning |
+|------|---------|
+| *(content source)* | contents come from **stdin** by default; `--from FILE` copies a file's bytes; `--content STR` uses a literal string. The three are mutually exclusive. |
+| `--nest` | place the content *under* the node (new subdir + file `a`) instead of *in* it (next file). |
+| `--unique` | prevent duplicates: if a covered file with byte-identical contents already exists, create nothing and print its path (exit `0`, idempotent). **in** compares every covered file of the node; **under** compares only the first covered file (`a`) of each immediate covered subdir — matching where the new content would land. |
+| `--dense` | fill the lowest vacant ordinal (gap) before extending past `last_*` (G6); default extends from `last_*`. |
+| `--sidecar delete\|regen` | what to do with the `.0` files the addition invalidates. `delete` (default) removes the stale sidecar of the changed node and every ancestor that has one; `regen` rewrites the changed node's `.0` (and the new subdir's, under `--nest`) from present state and refreshes existing ancestor sidecars. Either way **an invalid `.0` is never left in place** — `add` never silently leaves a stale rollup behind. |
+
+```
+echo "hello" | sdt add ./store              # → ./store/b   (next covered file)
+sdt add ./store --nest --from report.pdf    # → ./store/0/a (wrapped in a new subdir)
+sdt add ./store --unique --content dup       # prints an existing path if contents match
+sdt add ./store --nest --sidecar regen       # keep .0 files conforming as you go
+```
+
+The split mirrors the two sequences a node owns (§3.3): **in** extends the file
+sequence, **under** extends the directory sequence. The dedup scope follows from
+that — a nested add can only collide with another nested add's `a`, so that is
+the only thing it checks.
+
+---
+
 ## `sdt compact` — restore density (§3.6 rule 6, G6)
 
 Renumbers present covered entries of a kind so they form the dense prefix `1..N`,
@@ -272,5 +314,6 @@ verb link them — that alone guarantees they all agree on rule 6.
 2. `sdt read`, `sdt check` — read-only; make the rest testable.
 3. `sdt sidecar`, `sdt name` — the maintenance core (the two originally-requested
    tools).
-4. `sdt compact` — manages the format's sharpest edge (rule-6 fragility).
-5. `sdt pack` — scaling/interchange, once the core is solid.
+4. `sdt add` — single-file writes (in/under) with dedup, built on `name`.
+5. `sdt compact` — manages the format's sharpest edge (rule-6 fragility).
+6. `sdt pack` — scaling/interchange, once the core is solid.
