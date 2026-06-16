@@ -1,17 +1,19 @@
-# SDT Tooling — Proposed CLI
+# SDT Tooling — CLI
 
-**Status:** Proposal
+**Status:** Implemented
 **Date:** 2026-06-16
 **Relates to:** [sdt-spec.md](sdt-spec.md) v1.1
 
 > **Scope.** The spec defines a *static format* and deliberately omits a writer
-> (spec §§4.1, 7). These tools fill that gap: they read, check, and mutate SDT
+> (spec §§4.1, 7). These tools provide that missing writer surface: they read,
+> check, and mutate SDT
 > trees. Nothing here changes the format; a tree these tools produce is conformant
 > by the spec's own rules, and a tree they only read is left byte-for-byte intact.
 
-## Design principle
+## Command model
 
-One multitool, `sdt`, with a **small set of verbs**. Behavior is selected by
+The implementation is one multitool, `sdt`, with a **small set of verbs**.
+Behavior is selected by
 **flags**, not by proliferating separate commands. Eight verbs cover the whole
 surface:
 
@@ -38,7 +40,7 @@ parts:
   ten-missing-predecessors rule (rule 6), which is the one place ad-hoc tools get
   classification wrong.
 
-`sdt code` is the codec exposed directly; every other verb links the classifier.
+`sdt code` exposes the codec directly; every other verb uses the classifier.
 
 ## Global conventions
 
@@ -105,7 +107,7 @@ sdt read [PATH] [view-flag] [-r] [--json]
 | `--kind file\|dir` | restrict any view to one kind |
 
 ```
-sdt read --stat            # the would-be sidecar for cwd
+sdt read --stat            # computed sidecar fields for cwd
 sdt read --fragile -r      # subtree-wide rule-6 risk scan
 ```
 
@@ -305,15 +307,16 @@ sdt pack --extract ./store ./out --manifest store.map
 
 ---
 
-## Build order
+## Implementation notes
 
-Each verb reduces to the two shared libraries, so build those first and have every
-verb link them — that alone guarantees they all agree on rule 6.
+Each verb reduces to the two shared libraries, so the command surface stays
+consistent across read-only and writing operations:
 
-1. **codec** + **classifier** libraries → expose codec as `sdt code`.
-2. `sdt read`, `sdt check` — read-only; make the rest testable.
-3. `sdt sidecar`, `sdt name` — the maintenance core (the two originally-requested
-   tools).
-4. `sdt add` — single-file writes (in/under) with dedup, built on `name`.
-5. `sdt compact` — manages the format's sharpest edge (rule-6 fragility).
-6. `sdt pack` — scaling/interchange, once the core is solid.
+1. **codec** + **classifier** libraries back every command that interprets SDT
+   names.
+2. `sdt code` exposes the codec directly.
+3. `sdt read` and `sdt check` provide the read-only inspection and verification
+   surface.
+4. `sdt sidecar` and `sdt name` provide the maintenance core.
+5. `sdt add`, `sdt compact`, and `sdt pack` provide the writing, renumbering, and
+   interchange workflows.
