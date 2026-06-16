@@ -1,5 +1,7 @@
 # Sequential Directory Tree
 
+[![CI and Pages](https://github.com/curtcox/Sequential-Directory-Tree/actions/workflows/pages.yml/badge.svg)](https://github.com/curtcox/Sequential-Directory-Tree/actions/workflows/pages.yml)
+
 This repo contains `sdt`, a Rust command-line multitool for the Sequential
 Directory Tree format described in [sdt-spec.md](sdt-spec.md).
 
