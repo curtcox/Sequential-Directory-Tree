@@ -158,6 +158,64 @@ fn portability_flags_aux() {
         .code(1);
 }
 
+#[test]
+fn dir_names_use_underscore_prefix() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().to_str().unwrap();
+    // First ten dir indices are bare digits; index 11 onward (letters) carry `_`.
+    sdt()
+        .args(["name", path, "-k", "dir", "-n", "12"])
+        .assert()
+        .stdout("0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n_A\n_B\n");
+    // Materialize the first eleven dirs one at a time; the 11th lands as `_A`.
+    for _ in 0..11 {
+        sdt()
+            .args(["name", path, "-k", "dir", "--create"])
+            .assert()
+            .success();
+    }
+    assert!(t.path().join("9").exists());
+    assert!(t.path().join("_A").exists());
+    assert!(!t.path().join("A").exists());
+    // A tree with a `_`-prefixed covered dir round-trips through sidecar + check.
+    touch(t.path().join("_A").join("a"), b"nested");
+    sdt().args(["sidecar", "-r", path]).assert().success();
+    sdt().args(["check", "-r", path]).assert().success();
+}
+
+#[test]
+fn compact_dirs_renumber_with_prefix() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().to_str().unwrap();
+    // Dense 0..9 plus a gap, then a letter dir that must compact down to `_A`.
+    for n in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"] {
+        fs::create_dir(t.path().join(n)).unwrap();
+    }
+    fs::create_dir(t.path().join("_B")).unwrap(); // ordinal 12, gap at 11
+    let map = t.path().join("moves.tsv");
+    sdt()
+        .args(["compact", path, "-k", "dir", "--map", map.to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(t.path().join("_A").exists()); // 12 -> 11 -> "_A"
+    assert!(!t.path().join("_B").exists());
+}
+
+#[test]
+fn portability_no_collision_with_prefixed_dir() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().to_str().unwrap();
+    // file `aa` and dir `AA` would fold together on a case-insensitive FS, but the
+    // dir is stored `_AA`, so there is no collision to flag.
+    touch(t.path().join("aa"), b"f");
+    fs::create_dir(t.path().join("_AA")).unwrap();
+    sdt().args(["sidecar", "-r", path]).assert().success();
+    sdt()
+        .args(["check", path, "--portability"])
+        .assert()
+        .success();
+}
+
 fn read_sidecars(path: &Path) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     collect_sidecars(path, path, &mut out);

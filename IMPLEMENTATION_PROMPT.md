@@ -50,40 +50,62 @@ Property tests are mandatory here: for both kinds, `decode(encode(n)) == n` for
 Include the documented trap as an explicit test: `decode("z") == 26` and
 `decode("aa") == 27`, so lexicographic order ≠ ordinal order.
 
-### Classifier — the five rules (spec §3.6)
+**Directory storage prefix (spec §3.7).** `encode`/`decode` operate on the
+*logical* index. A covered directory whose index contains a letter is stored on
+disk with a single leading `_` (`A` → `_A`, `AB` → `_AB`); digit-only indices
+(`0`–`9`, `00`–`99`, …) and all file names are stored bare. Provide:
+- `storage_name(n, dir)` — the on-disk name (adds `_` for letter-bearing dir
+  indices); `storage_name(n, file)` is just the index.
+- `decode(s, dir)` — strips a single leading `_` before decoding, so
+  `decode("_A") == decode("A") == 11`.
+- `is_canonical_dir_name(s)` — true iff `s` is a digit-only dir index stored bare
+  or a letter-bearing dir index stored `_`-prefixed.
+
+The prefix exists only to keep covered names from colliding on case-insensitive
+filesystems and is **omitted when paths go into URLs** (spec §3.7, §6.4).
+
+### Classifier — the six rules (spec §3.6, §3.7)
 
 Given a node's directory entries, classify each as exactly one of: `Sidecar`
 (the name `.0`), `CoveredFile`, `CoveredDir`, or `Extra`. Validity (spec §3.5):
-a **valid file index** is 1–3 chars all in `a..z`; a **valid dir index** is 1–3
-chars all in `0..9A..Z`; the two sets are disjoint.
+a **valid file index** is 1–3 chars all in `a..z`; a **valid (logical) dir index**
+is 1–3 chars all in `0..9A..Z`; the two sets are disjoint. For a **directory**
+whose name begins with `_`, its **core** is the name minus that single leading
+underscore (spec §3.6); for every other entry the core is the whole name.
 
 An entry is `Extra` if **any** rule holds:
-1. name longer than 3 characters;
-2. name contains a character outside `[0-9A-Za-z]` (this also excludes dotfiles
-   and `.0` from the covered sets);
-3. it is a **regular file** whose name is a valid **dir** index (e.g. file `A`,
+1. its core is empty or longer than 3 characters (so a `_`-prefixed dir may be up
+   to 4 chars on disk);
+2. its core contains a character outside `[0-9A-Za-z]` (this excludes dotfiles
+   and `.0`; a `_` is allowed only as a directory's leading prefix, so a file
+   beginning with `_` is extra);
+3. it is a **directory** stored in non-canonical form (spec §3.7): a leading `_`
+   with a digit-only core (e.g. `_00`), **or** a letter-bearing core with no `_`
+   (e.g. `AB`);
+4. it is a **regular file** whose name is a valid **dir** index (e.g. file `A`,
    file `07`);
-4. it is a **directory** whose name is a valid **file** index (e.g. dir `b`,
+5. it is a **directory** whose core is a valid **file** index (e.g. dir `b`,
    dir `aa`);
-5. **ten-or-more missing immediate predecessors.** For an entry of kind *K* at
-   ordinal `n = decode(name)`, considering only the present same-kind entries in
+6. **ten-or-more missing immediate predecessors.** For an entry of kind *K* at
+   ordinal `n = decode(core)`, considering only the present same-kind entries in
    this node: the entry is extra iff `n >= 11` **and none** of the ten ordinals
    `n-1, n-2, …, n-10` is present. If any one of those ten is present, the run is
    shorter than ten and the entry is **not** made extra by this rule.
 
 Otherwise it is `CoveredFile` (regular file, valid file index) or `CoveredDir`
-(directory, valid dir index). Record, for each `Extra`, which rule fired (needed
-by `sdt read`).
+(directory whose on-disk name is canonical per §3.7). Record, for each `Extra`,
+which rule fired (needed by `sdt read`).
 
-**Rule 5 is the sharpest edge — test it hard.** Cases that must pass:
-- `n < 11` is never extra by rule 5 regardless of gaps.
+**Rule 6 is the sharpest edge — test it hard.** Cases that must pass:
+- `n < 11` is never extra by rule 6 regardless of gaps.
 - exactly ten vacant slots `n-1..n-10` ⇒ extra; nine vacant + one present ⇒ not.
 - a present entry at `n-5` (with `n-1..n-4` vacant) ⇒ run of 4 ⇒ **not** extra.
 - classification is **non-local**: deleting an entry can flip a *different*
   entry's classification. Add a test that removes one entry and asserts another
   entry's class changes.
-- case sensitivity (spec §3.5/§6.2): file `aa` and dir `AA` coexist and classify
-  independently.
+- prefix handling (spec §3.7): a letter-bearing covered dir is stored `_`-prefixed
+  (e.g. `_A`); a bare `AB` and a prefixed `_00` are extras (rule 3); file `aa` and
+  dir `_AA` coexist and classify independently **even under case folding**.
 
 ### Sidecar derivation (spec §4.2, §5)
 
@@ -92,7 +114,8 @@ each `\n`-terminated, UTF-8 (spec §4.3). Sidecars are **excluded from all
 counts** at every level.
 
 1. `last_file` — covered file with the max **decoded** ordinal, or empty.
-2. `last_dir` — covered dir with the max decoded ordinal, or empty.
+2. `last_dir` — covered dir with the max decoded ordinal, or empty; recorded as
+   the **logical** index, without the §3.7 `_` prefix (on-disk `_AB` ⇒ `AB`).
 3. `extra_files` — count of extra **files** directly in this node.
 4. `extra_dirs` — count of extra **dirs** directly in this node.
 5. `missing_files` — `decode(last_file) - (count of present covered files)`, or 0
@@ -125,14 +148,16 @@ Implement exactly the surface in `tools.md`. Global conventions:
 2. **`sdt read [PATH]`** — read-only. Default: classify entries with decoded
    ordinal and, for extras, the rule that fired. `--stat`: the nine derived fields
    (§5) whether or not a `.0` exists. `--gaps`: list vacant ordinals behind
-   `last_*`. `--fragile`: for each covered entry, how many of its ten rule-5
+   `last_*`. `--fragile`: for each covered entry, how many of its ten rule-6
    predecessor slots are vacant (flag those one deletion from becoming extra).
    `--kind`, `-r`, `--json`.
 3. **`sdt check [PATH]`** — read-only; **never writes**. Default: for every present
    `.0`, assert 9-line format and value-equality with §5 present-state derivation.
-   `--portability`: flag §6 hazards — Windows reserved names once the sequence
-   reaches `aux`/`AUX`/`CON`/`PRN`/`NUL` (§6.3), case-fold collisions like file
-   `aa` vs dir `AA` (§6.2), nodes over GitHub's 3,000 combined-entry soft cap or
+   `--portability`: flag §6 hazards — Windows reserved **file** names once the file
+   sequence reaches `aux`/`con`/`prn`/`nul` (§6.3; covered dirs are safe via the
+   `_` prefix, e.g. `_AUX`), residual case-fold collisions (the §3.7 prefix keeps
+   covered dirs from folding onto covered files, so this mainly catches extras and
+   non-canonical names, §6.2), nodes over GitHub's 3,000 combined-entry soft cap or
    ext4's 64,000 subdir hard cap (§6.1). `--against TREE`: structural diff
    (ordinals added/removed per node, totals deltas). `--format-only`,
    `--strict`. Exit `1` on any failure.
@@ -143,10 +168,11 @@ Implement exactly the surface in `tools.md`. Global conventions:
    `--prune` removes `.0`s. `--watch` + `--debounce MS` stays resident via
    `notify`, applying `--changed`-style incremental refreshes. `--dry-run`.
 5. **`sdt name [PATH]`** — default read-only: print next name(s) = `last_* + 1` by
-   decoded ordinal for `--kind` (default `file`). `-n/--count N`. `--dense` fills
-   vacant ordinals before extending past `last_*`. `--create` materializes (empty
-   file / new dir). `--cap-check` fails when at length-3 capacity (§3.4) or over
-   the §6.1 soft cap.
+   decoded ordinal for `--kind` (default `file`), as **on-disk storage names** (so
+   letter-bearing dir indices carry the §3.7 `_` prefix). `-n/--count N`.
+   `--dense` fills vacant ordinals before extending past `last_*`. `--create`
+   materializes (empty file / new dir). `--cap-check` fails when at length-3
+   capacity (§3.4) or over the §6.1 soft cap.
 6. **`sdt compact [PATH]`** — renames covered entries of `--kind` (default both) to
    the dense prefix `1..N` by ascending decoded ordinal, driving `missing_*` to 0.
    `--map FILE` is **required** unless `--dry-run` (record old→new, tab-separated).
@@ -162,9 +188,10 @@ Implement exactly the surface in `tools.md`. Global conventions:
 
 ## Testing & fixtures (required — this is the quality bar)
 
-- **`sdt-core` unit/property tests** for codec (round-trip, the `z`/`aa` trap) and
-  classifier (all five rules, the rule-5 cases listed above, non-locality, case
-  sensitivity) and derivation (the spec §4.3 worked example: `last_file=c`,
+- **`sdt-core` unit/property tests** for codec (round-trip, the `z`/`aa` trap, the
+  §3.7 prefix: `storage_name`, `_`-tolerant `decode`, `is_canonical_dir_name`) and
+  classifier (all six rules, the rule-6 cases listed above, non-locality, the
+  prefix cases) and derivation (the spec §4.3 worked example: `last_file=c`,
   `last_dir=2`, `extra_files=1`, totals `9/4/41213` — reproduce that tree as a
   fixture and assert the derived sidecar matches byte-for-byte).
 - **CLI integration tests** with `assert_cmd` + `tempfile`: build on-disk fixture
@@ -173,12 +200,14 @@ Implement exactly the surface in `tools.md`. Global conventions:
     hand-corrupt a `.0` (wrong value, then ≠9 lines).
   - **Round-trip:** `sidecar -r` then `check -r` ⇒ exit 0 on several shapes
     (empty node, dense node, node with gaps, node with extras, nested subtree,
-    a tree containing an entry made extra by rule 5).
+    a node containing a `_`-prefixed covered dir, a tree containing an entry made
+    extra by rule 6).
   - `sidecar --changed` produces byte-identical `.0`s to a full `sidecar -r` on
     the same tree (incremental ≡ full recompute).
   - `name`/`compact`/`pack`+`pack --extract` round-trips (extract reproduces the
     original fileset and relative paths from tree+manifest).
-  - `check --portability` flags an `aux` file and an `aa`-file/`AA`-dir pair.
+  - `check --portability` flags an `aux` file; and a `_`-prefixed covered dir
+    (e.g. `_AA`) does **not** collide with file `aa` (§3.7), so that pair passes.
 - Provide a `cargo test` that runs green, and a short `README`/`--help` covering
   the verbs.
 

@@ -10,8 +10,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sdt_core::{
-    classify_dir, decode, derive_subtree, encode, fragile, gaps, valid_index, Class, ExtraRule,
-    Kind, Sidecar,
+    classify_dir, decode, derive_subtree, encode, fragile, gaps, is_canonical_dir_name,
+    storage_name, valid_index, Class, ExtraRule, Kind, Sidecar,
 };
 
 #[derive(Parser)]
@@ -264,7 +264,13 @@ fn cmd_code(
     for arg in args {
         let k = kind.unwrap_or_else(|| infer_kind(&arg));
         if validate {
-            if !valid_index(&arg, k) {
+            // For dirs, accept either the logical index or its canonical on-disk
+            // form with the §3.7 `_` prefix (e.g. both `R` and `_R`).
+            let valid = match k {
+                Kind::File => valid_index(&arg, Kind::File),
+                Kind::Dir => valid_index(&arg, Kind::Dir) || is_canonical_dir_name(&arg),
+            };
+            if !valid {
                 ok = false;
             }
             continue;
@@ -588,7 +594,9 @@ fn cmd_name(
             return Err(anyhow!("{} namespace capacity exceeded", kind_name(kind)));
         }
         if !dense || !present.contains(&next) {
-            let name = encode(next, kind)?;
+            // On-disk storage name: directory indices with a letter get the
+            // §3.7 `_` prefix; file names are unprefixed.
+            let name = storage_name(next, kind)?;
             if create {
                 let p = path.join(&name);
                 match kind {
@@ -635,7 +643,9 @@ fn cmd_compact(
                 .collect();
             entries.sort_by_key(|(_, ordinal)| *ordinal);
             for (i, (e, _)) in entries.iter().enumerate() {
-                let new = encode((i + 1) as u64, k)?;
+                // Rename to the dense on-disk name (with the §3.7 `_` prefix for
+                // letter-bearing dir indices).
+                let new = storage_name((i + 1) as u64, k)?;
                 if e.name != new {
                     moves.push((node.join(&e.name), node.join(new)));
                 }
@@ -706,11 +716,11 @@ fn cmd_pack(
             let node = if dir_ord == 1 {
                 dest.clone()
             } else {
-                let d = encode(dir_ord - 1, Kind::Dir)?;
+                let d = storage_name(dir_ord - 1, Kind::Dir)?;
                 fs::create_dir_all(dest.join(&d))?;
                 dest.join(d)
             };
-            let name = encode(file_ord, Kind::File)?;
+            let name = storage_name(file_ord, Kind::File)?;
             fs::copy(&file, node.join(&name))?;
             let stored = node.join(&name).strip_prefix(&dest)?.display().to_string();
             map.push_str(&format!("{}\t{}\n", stored, origin.display()));
@@ -823,6 +833,7 @@ fn rule_label(rule: &ExtraRule) -> &'static str {
     match rule {
         ExtraRule::NameTooLong => "name-too-long",
         ExtraRule::NonAlnum => "non-alnum",
+        ExtraRule::NonCanonicalDirForm => "non-canonical-dir-form",
         ExtraRule::FileNamedDirIndex => "file-named-dir-index",
         ExtraRule::DirNamedFileIndex => "dir-named-file-index",
         ExtraRule::TenMissingPredecessors => "ten-missing-predecessors",

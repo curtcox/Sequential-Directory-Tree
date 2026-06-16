@@ -1,7 +1,15 @@
-# Sequential Directory Tree (SDT) — Specification v1.0
+# Sequential Directory Tree (SDT) — Specification v1.1
 
 **Status:** Draft
-**Date:** 2026-06-14
+**Date:** 2026-06-16
+
+> **Changes in v1.1.** Covered directory indices that contain a letter are now
+> stored on disk with a single leading underscore (`A` → `_A`, `AB` → `_AB`), so
+> a conforming tree maps without collision onto case-insensitive/​case-folding
+> filesystems. The underscore is a *storage prefix only*: it is not part of the
+> index, it is omitted when a path is embedded in a URL, and it exists solely to
+> support case-insensitive filesystem mapping. See §3.7; classification (§3.6),
+> the sidecar (§4), and portability (§6.2–§6.4) are updated accordingly.
 
 > **Note on scope.** This is a *static format* specification. It
 > describes what a conforming directory tree looks like on disk and how to
@@ -45,8 +53,9 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY**, and
 1. **G1 — Minimal names.** A covered index is the shortest unique string for its
    ordinal.
 2. **G2 — Arbitrary nesting.** Directories nest to unbounded depth.
-3. **G3 — Portable names.** Covered names embed safely in filesystems, URLs, and
-   text (§6.3).
+3. **G3 — Portable names.** Covered names embed safely in filesystems (including
+   case-insensitive ones, via the §3.7 underscore prefix), URLs (prefix omitted,
+   §6.4), and text (§6.2–§6.4).
 4. **G4 — Unambiguous classification.** Every entry in a node is exactly one of:
    the sidecar, a covered file, a covered directory, or an extra entry.
 5. **G5 — Bounded fan-out.** The covered namespace per node is finite (§3.4),
@@ -79,7 +88,10 @@ Covered directories use **bijective base-36** over `0..9` then `A..Z`:
 0, 1, ..., 9, A, B, ..., Z, 00, 01, ..., ZZ, 000, ..., ZZZ
 ```
 
-The first dir index is `0`.
+The first dir index is `0`. A directory index that contains a letter is stored on
+disk with a single leading underscore (`A` → `_A`); digit-only indices are stored
+verbatim. The underscore is a storage prefix only, not part of the index — see
+§3.7.
 
 ### 3.3 Bijection (encode / decode)
 
@@ -119,28 +131,53 @@ A node therefore holds at most 18,278 covered files and 47,988 covered
 directories, plus the optional sidecar and any extras. These bounds sit under
 filesystem hard limits; the binding *soft* limit is discussed in §6.1.
 
+Index strings remain capped at three characters; the cap is on the **index**, not
+the on-disk name. A letter-bearing directory's on-disk name carries a leading `_`
+(§3.7), so on-disk directory names range up to **four** characters (`_ZZZ`). The
+capacity counts above (numbers of indices) are unaffected by the prefix.
+
 ### 3.5 Validity of an index string
 
 A string is a **valid file index** iff it is 1–3 characters, all in `a..z`.
-A string is a **valid dir index** iff it is 1–3 characters, all in `0..9A..Z`.
-The two valid-index sets are disjoint as strings (lowercase vs. digits/uppercase).
+A string is a **valid (logical) dir index** iff it is 1–3 characters, all in
+`0..9A..Z`. The two valid-index sets are disjoint as strings (lowercase vs.
+digits/uppercase).
+
+A directory's **on-disk name** is *canonical* iff it is either a digit-only valid
+dir index stored verbatim, or a letter-bearing valid dir index stored with a
+single leading `_` (§3.7). Equivalently: strip a single leading `_` if present to
+obtain the **core**; the name is a canonical covered-directory name iff the core
+is a valid dir index *and* the presence of the `_` matches the core's kind
+(prefixed iff the core contains a letter). Covered files are never prefixed.
 
 ### 3.6 Classification rules (covered vs. extra vs. sidecar)
 
 Within a node, classify each directory entry by present state. The name `.0` is
 **reserved** for the sidecar and is neither covered nor extra.
 
+For a **directory** entry whose name begins with `_`, let its **core** be the name
+with that single leading underscore removed; for every other entry the core is the
+whole name. The leading `_` is meaningful only on directories (§3.7).
+
 An entry is an **extra entry** if **any** of the following hold:
 
-1. Its name is **longer than 3 characters**.
-2. Its name contains a character **outside `[0-9A-Za-z]`** (this also excludes
-   dotfiles and `.0` itself from the covered sets).
-3. It is a **regular file whose name is a valid directory index** (digits or
+1. Its core is **empty or longer than 3 characters**. (After the optional `_` is
+   removed, a covered directory's core is ≤3 chars, so its on-disk name is ≤4
+   chars; any other name with a longer core is extra.)
+2. Its core contains a character **outside `[0-9A-Za-z]`** (this excludes
+   dotfiles and `.0` itself). A leading `_` is permitted only on directories, so a
+   file whose name begins with `_` — or any entry whose core still contains `_` —
+   is extra.
+3. It is a **directory whose stored form is non-canonical** for its core (§3.7):
+   the name carries a leading `_` but the core is digit-only (digit indices MUST
+   be stored bare), **or** the core contains a letter but the name has no leading
+   `_` (letter indices MUST be stored `_`-prefixed).
+4. It is a **regular file whose name is a valid directory index** (digits or
    uppercase; e.g. a file named `A` or `07`).
-4. It is a **directory whose name is a valid file index** (lowercase; e.g. a
+5. It is a **directory whose core is a valid file index** (lowercase; e.g. a
    directory named `b` or `aa`).
-5. It has **ten or more missing immediate predecessors**: for an entry of kind
-   *K* at ordinal `n = decode(name)`, examine the present same-kind entries in
+6. It has **ten or more missing immediate predecessors**: for an entry of kind
+   *K* at ordinal `n = decode(core)`, examine the present same-kind entries in
    this node. The entry is extra iff `n ≥ 11` **and** none of the ten ordinals
    `n-1, n-2, …, n-10` is present. Equivalently: there are ten consecutive vacant
    same-kind slots directly below `n`. If any predecessor within that window is
@@ -149,15 +186,57 @@ An entry is an **extra entry** if **any** of the following hold:
    `n-5` — is a run of four, not ten, so the entry stays covered.)
 
 Otherwise the entry is a **covered file** (regular file, valid file index) or a
-**covered directory** (directory, valid dir index).
+**covered directory** (directory whose on-disk name is canonical per §3.5/§3.7).
 
-> **Reader-side classifier.** Rules 1–5 let a reader classify a directory it did
+> **Reader-side classifier.** Rules 1–6 let a reader classify a directory it did
 > not build — hand-edited, produced by other tooling, or corrupted — without
-> ambiguity (G4). Rules 3 and 4 mean SDT does not forbid a file named `A` or a
-> directory named `b`; it admits them as *extras*. The covered file and covered
-> dir sequences remain mutually non-colliding because covered files are lowercase
-> and covered dirs are digits/uppercase (§3.5). This classification is
-> case-sensitive; see §6.2.
+> ambiguity (G4). Rules 4 and 5 mean SDT does not forbid a file named `A` or a
+> directory named `b`; it admits them as *extras*. Rule 3 makes the underscore
+> prefix mandatory: a bare letter-bearing directory (`AB`) and a prefixed
+> digit-only one (`_00`) are both extras, so the on-disk form of any covered
+> directory is unique. The covered file and covered dir sequences remain mutually
+> non-colliding — covered files are lowercase, covered dirs are digit-only or
+> `_`-prefixed — on both case-sensitive and case-folding filesystems (§3.7, §6.2).
+
+### 3.7 Case-insensitive storage prefix
+
+Covered files are lowercase (`a–z`) and covered directories use `0–9A–Z`. On a
+case-folding filesystem (default APFS on macOS, NTFS on Windows) a directory
+index that contains a letter folds onto the lowercase file namespace — a
+directory `A` collides with a file `a`, and `AB` with `ab` — breaking
+classification (§6.2). Digit-only directory indices (`0`–`9`, `00`–`99`, …)
+contain no letters and never fold onto a file name (files have no digits), so they
+carry no hazard.
+
+So that a conforming tree maps onto case-insensitive filesystems without
+collisions, a covered directory whose **index contains at least one letter
+(`A–Z`)** is stored on disk with a single leading underscore:
+
+| Logical index | On-disk name |
+|---|---|
+| `0` … `9` (digit-only) | `0` … `9` (unchanged) |
+| `00` … `99` (digit-only) | `00` … `99` (unchanged) |
+| `A`, `Z`, `AB`, `0A`, `ZZZ` | `_A`, `_Z`, `_AB`, `_0A`, `_ZZZ` |
+
+The underscore is **not part of the index**: it is a storage prefix only, the sole
+exception to "covered names are drawn from `[0-9A-Za-z]`", and it applies to
+directories only — covered files are never prefixed. Because no covered file
+begins with `_` and no digit-only directory is prefixed, every covered on-disk
+name folds to a distinct entry on a case-insensitive filesystem.
+
+`decode` of an on-disk directory name strips a single leading `_`, if present,
+then decodes the remainder as a logical dir index (§3.3). The prefix never
+participates in the ordinal: `decode("_A") = decode("A") = 11`.
+
+**The prefix exists only for filesystem mapping, and is omitted in URLs.** Its one
+purpose is easy mapping onto case-insensitive filesystems. When a covered path is
+embedded in a URL the prefix is **omitted** — the URL uses the bare logical index
+(`…/A/…`, never `…/_A/…`); see §6.4. (`_` is itself unreserved per RFC 3986, so
+its omission is canonicalization for goal G3, not escaping.)
+
+This is mandatory canonical form: a letter-bearing directory index stored
+**without** the prefix, or a digit-only index stored **with** one, is
+non-canonical and is reclassified as an **extra** entry (§3.6 rule 3).
 
 ## 4. The `.0` sidecar
 
@@ -200,6 +279,9 @@ Notes:
   the subtree.
 - `last_*` is the convention-order maximum present covered entry by **decoded
   ordinal**, not lexicographic order (`z`=26 < `aa`=27).
+- `last_dir` records the **logical** dir index, without the `_` storage prefix
+  (§3.7): a node whose last covered directory is stored on disk as `_AB` has
+  `last_dir = AB`. `decode(last_dir)` therefore operates on the bare index.
 - `missing_*` is a static density measure: zero exactly when the present covered
   entries of that kind form the dense prefix `1..decode(last_*)`. A nonzero value
   means a gap exists; the spec does not interpret *why*.
@@ -235,6 +317,18 @@ a node lacking a sidecar, or to verify one that has it. It defines no writer and
 imposes no maintenance schedule.
 
 ```
+core(e):                                       # §3.6: strip one leading "_" on dirs
+    if e.is_dir and e.name.startswith("_"):
+        return e.name[1:]
+    return e.name
+
+is_canonical_dir_name(name):                   # §3.5 / §3.7
+    prefixed = name.startswith("_")
+    c = name[1:] if prefixed else name
+    if not is_dir_index(c): return False        # 1–3 chars over 0-9A-Z
+    has_letter = any(ch in UPPER for ch in c)   # A..Z
+    return prefixed == has_letter               # letters ⇒ prefixed; digits ⇒ bare
+
 classify(node):                                # §3.6
     files, dirs, extras = [], [], []
     for e in entries(node):
@@ -243,24 +337,27 @@ classify(node):                                # §3.6
             extras.append(e)
         elif e.is_file and is_file_index(e.name):
             files.append(e)
-        elif e.is_dir and is_dir_index(e.name):
+        elif e.is_dir and is_canonical_dir_name(e.name):
             dirs.append(e)
         else:
             extras.append(e)
     return files, dirs, extras
 
-is_extra(e, node):                             # §3.6 rules 1–5
-    if len(e.name) > 3: return True
-    if any(c not in ALNUM for c in e.name): return True
-    if e.is_file and is_dir_index(e.name):  return True
-    if e.is_dir  and is_file_index(e.name): return True
-    if has_ten_missing_predecessors(e, node): return True
+is_extra(e, node):                             # §3.6 rules 1–6
+    c = core(e)
+    if len(c) == 0 or len(c) > 3: return True               # rule 1
+    if any(ch not in ALNUM for ch in c): return True        # rule 2 (also stray "_")
+    if e.is_dir and is_dir_index(c) and not is_canonical_dir_name(e.name):
+        return True                                         # rule 3 (non-canonical "_")
+    if e.is_file and is_dir_index(e.name):  return True     # rule 4
+    if e.is_dir  and is_file_index(c):      return True     # rule 5
+    if has_ten_missing_predecessors(e, node): return True   # rule 6
     return False
 
 has_ten_missing_predecessors(e, node):         # present-state, same kind
-    n = decode(e.name, alphabet_for(e))
+    n = decode(core(e), alphabet_for(e))
     if n < 11: return False
-    present = present_ordinals_of_kind(e, node)
+    present = present_ordinals_of_kind(e, node)  # decode(core(x)) over same-kind x
     for d in range(1, 11):                      # n-1 .. n-10
         if (n - d) in present:
             return False                        # a predecessor is present ⇒ run < 10
@@ -268,8 +365,8 @@ has_ten_missing_predecessors(e, node):         # present-state, same kind
 
 local_fields(node):
     files, dirs, extras = classify(node)
-    last_file = name_of_max(files, by=decode_file)   # "" if none
-    last_dir  = name_of_max(dirs,  by=decode_dir)    # "" if none
+    last_file = name_of_max(files, by=decode_file)         # "" if none
+    last_dir  = core(name_of_max(dirs, by=lambda d: decode_dir(core(d))))  # logical, no "_"
     missing_files = (decode_file(last_file) - len(files)) if last_file else 0
     missing_dirs  = (decode_dir(last_dir)   - len(dirs))  if last_dir  else 0
     extra_files = count(x for x in extras if x.is_file)
@@ -324,26 +421,41 @@ permits the full 18,278 / 47,988 regardless. On local filesystems
 
 ### 6.2 Case-folding filesystems
 
-Classification (§3.5/§3.6) is case-sensitive: covered files are lowercase,
-covered dirs are digits/uppercase. On case-insensitive or case-folding
-filesystems (default APFS on macOS, NTFS/Windows) and across transports that fold
-case, a covered file `aa` and covered directory `AA` are distinct only because
-one is a file and one is a directory; tooling that compares names
-case-insensitively, or that changes case in transit, can break classification.
-Deployments targeting such environments **MUST** preserve case exactly end to end
-and **SHOULD** round-trip-test through every transport in scope (especially Git
+Covered files are lowercase and covered dirs are digit-only or `_`-prefixed
+uppercase. The `_` storage prefix (§3.7) is what makes a covered tree survive
+case folding: a letter-bearing directory `AA` is stored as `_AA`, which cannot
+fold onto the covered file `aa` (no covered file begins with `_`), and digit-only
+directories such as `00` cannot fold onto any file (files have no digits). So on
+case-insensitive or case-folding filesystems (default APFS on macOS,
+NTFS/Windows) the covered file and covered directory namespaces stay disjoint
+**under case folding**, not merely under case-sensitive comparison.
+
+Two residual cautions remain. First, distinct covered directories never fold
+together (each uses a single letter case), but **extras** can still collide
+across case (e.g. extra files `Readme` and `README`); SDT does not protect
+extras. Second, a covered name's case must still survive transit: tooling that
+*alters* the case of a covered directory's letters in flight would corrupt its
+index even with the prefix in place. Deployments targeting case-folding
+environments **MUST** preserve the case of covered letters end to end and
+**SHOULD** round-trip-test through every transport in scope (especially Git
 checkout on Windows/macOS).
 
 ### 6.3 Reserved device names (Windows)
 
-Within the length-3 covered space, both sequences emit names that collide with
-Windows reserved device names. In the file sequence the index **`aux`** is a
-reserved name (as are `con`, `prn`, `nul`); in the directory sequence the indices
-**`AUX`**, **`CON`**, **`PRN`**, **`NUL`** are likewise reserved. On a
-Windows-native filesystem, attempting to materialize the covered entry at `aux`
-(and at the corresponding dir names) fails or behaves specially, so a raw SDT
-tree cannot be fully realized on Windows once the sequence reaches `aux`. SDT does
-not otherwise accommodate Windows device-name rules; deployments that must touch
+Within the length-3 covered space, the bare index sequences emit names that
+collide with Windows reserved device names. In the file sequence the index
+**`aux`** is a reserved name (as are `con`, `prn`, `nul`); the directory indices
+**`AUX`**, **`CON`**, **`PRN`**, **`NUL`** would be reserved too — but because
+every letter-bearing directory is stored `_`-prefixed (§3.7), these are
+materialized as **`_AUX`**, **`_CON`**, **`_PRN`**, **`_NUL`**, none of which is a
+reserved device name. The `_` prefix therefore incidentally **resolves the
+reserved-name hazard for covered directories**.
+
+It does **not** resolve it for covered *files*, which are never prefixed: on a
+Windows-native filesystem, materializing the covered file at `aux` (and `con`,
+`prn`, `nul`) still fails or behaves specially, so a raw SDT tree cannot be fully
+realized on Windows once the file sequence reaches `aux`. SDT does not otherwise
+accommodate Windows device-name rules; deployments that must touch
 Windows-native filesystems should host the tree inside a case-sensitive,
 reserved-name-agnostic container (e.g. an archive or image) rather than expanding
 it directly onto such a filesystem.
@@ -354,6 +466,15 @@ All covered index characters (`a–z`, `0–9`, `A–Z`) are unreserved per RFC 
 `.0` adds only `.`, also unreserved. SDT covered paths are URL-safe without
 percent-encoding (G3 for URLs). Extras MAY contain characters needing escaping.
 
+**The `_` storage prefix (§3.7) is omitted in URLs.** When a covered path is
+embedded in a URL, each directory component uses its bare logical index, not its
+on-disk name: a directory stored as `_AB` appears in the URL as `AB`. The prefix
+serves only case-insensitive filesystem mapping and has no role in URL form. (The
+underscore is itself unreserved per RFC 3986, so omitting it is canonicalization,
+not escaping — the URL stays percent-encoding-free either way.) A reader
+reconstructs the on-disk path from a URL path by re-applying §3.7: re-prefix any
+directory component whose index contains a letter.
+
 ## 7. Conformance
 
 SDT defines conformance for **trees** and for **readers**. It defines no writer.
@@ -363,10 +484,11 @@ node that has a `.0`, satisfies §4 (the sidecar's values equal what §5 compute
 from present state, with sidecars excluded from counts). A tree with no sidecars
 anywhere is conformant as long as its entries classify under §3.
 
-A **conformant reader** classifies every entry by §3.6, treats rules 1–5 as
-authoritative regardless of how the tree was produced, derives or verifies
-sidecar fields by §5, and rejects a malformed `.0` (§4.3) without modifying the
-tree.
+A **conformant reader** classifies every entry by §3.6, treats rules 1–6 as
+authoritative regardless of how the tree was produced, honors the §3.7 underscore
+prefix when decoding and when reconstructing on-disk paths from URLs, derives or
+verifies sidecar fields by §5, and rejects a malformed `.0` (§4.3) without
+modifying the tree.
 
 ## 8. Related work and prior art
 
@@ -479,7 +601,7 @@ SDT's three defining features (see end of section).
 No surveyed standard combines all three of: (1) a finite, length-capped *ordinal*
 namespace generated as bijective base-26/36 (vs. digest-keyed OCFL/OCI/Git/IPFS,
 or externally-supplied identifiers in Pairtree, or timestamp+PID in Maildir);
-(2) a fixed five-rule covered/extra classifier that lets a reader disambiguate any
+(2) a fixed six-rule covered/extra classifier that lets a reader disambiguate any
 directory it did not build; and (3) an optional per-node *recursive-rollup*
 sidecar defined purely by present-state equivalence. The nearest single-axis
 matches are Pairtree (self-describing identifier→path), Kafka (ordinal filenames +
